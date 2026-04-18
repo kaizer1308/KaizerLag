@@ -1,0 +1,38 @@
+# ── Build output directories ───────────────────────────────────────────────
+x64/
+Release/
+Debug/
+KaizerLag/x64/
+KaizerLag/Release/
+KaizerLag/Debug/
+
+# ── Compiler/linker artifacts ──────────────────────────────────────────────
+*.obj
+*.exe
+*.lib
+*.ilk
+*.pch
+*.pdb
+*.iobj
+*.ipdb
+*.res
+*.recipe
+*.FileListAbsolute.txt
+
+# ── MSBuild / VS intermediate files ───────────────────────────────────────
+*.tlog
+*.log
+*.lastbuildstate
+*.unsuccessfulbuild
+*.aps
+
+# ── Visual Studio project user files ──────────────────────────────────────
+*.vcxproj.user
+*.suo
+*.VC.db
+*.VC.opendb
+.vs/
+
+# ── Windows ────────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
