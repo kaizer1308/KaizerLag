@@ -1,41 +1,10 @@
 /*
-    Made by: GatoLouco
+    Made by: ALEHACKsp
     Improved by: kaizer1308
-    Github:  https://github.com/bwmsdroid/exitlag-hwid-bypass
+    Github:  https://github.com/ALEHACKsp/hwid-bypass
 
     x64 rewrite (ExitLag 5.20.x and later, which ships as a 64-bit binary).
 
-    Strategy:
-        - ExitLag builds a JSON "network_adapters" array containing
-          { device_id, product_name } entries, sourced from WMI's
-          Win32_NetworkAdapter. This array is part of the HWID / machine
-          fingerprint sent to ExitLag's auth backend on login.
-        - A *second* serializer builds a richer JSON that includes
-          { macAddress, name, device, ... } per adapter. This was NOT
-          previously hooked, leaking real MAC addresses.
-        - We install THREE hooks:
-          1. Inline hook on the fromStdWString call site (found
-             dynamically via pattern cascade) to randomize device_id /
-             product_name / MACAddress wstrings.
-          2. IAT hook on GetAdaptersAddresses (IPHLPAPI) to randomize
-             the PhysicalAddress bytes BEFORE Qt or ExitLag reads them.
-             This covers ALL code paths that read MAC addresses.
-          3. IAT-resolved patch of _Thrd_hardware_concurrency (imported
-             from MSVCP140.dll) to return a spoofed CPU thread count.
-             No hardcoded RVAs.
-
-    Update resilience:
-        - The inline hook uses a cascading pattern search (most-specific
-          to most-generic) so that minor recompilations don't break it.
-        - Stolen instructions are read dynamically from the hook site
-          rather than being hardcoded, so stack frame offset changes
-          are handled automatically.
-        - _Thrd_hardware_concurrency is found via IAT import name
-          resolution, not a hardcoded RVA.
-
-    MUST be built as x64 (Platform=x64). A 32-bit bypass cannot enumerate
-    modules of a 64-bit target via Toolhelp32, which is exactly what
-    caused the original "Error on GetModuleAddress..." report.
 */
 
 #include <iostream>
@@ -59,37 +28,147 @@ using std::vector;
 
 #include "AuxFunctions.hpp"
 
-// Console handle for colored output.
 static HANDLE g_console = GetStdHandle(STD_OUTPUT_HANDLE);
 
-static void PrintError(const char* msg) {
-    SetConsoleTextAttribute(g_console, 0x0c);
-    cout << "[ERROR] " << msg << endl;
-}
+namespace Log {
+    // Windows console color constants
+    enum Color : WORD {
+        RESET   = 0x07,  // light grey on black
+        RED     = 0x0C,  // bright red
+        GREEN   = 0x0A,  // bright green
+        YELLOW  = 0x0E,  // bright yellow
+        CYAN    = 0x0B,  // bright cyan
+        DIM     = 0x08,  // dark grey
+        WHITE   = 0x0F,  // bright white
+        MAGENTA = 0x0D,  // bright magenta
+    };
 
-static void PrintInfo(const char* msg) {
-    SetConsoleTextAttribute(g_console, 0x0b);
-    cout << "[INFO]  " << msg << endl;
-}
+    static void SetColor(Color c) { SetConsoleTextAttribute(g_console, c); }
 
-static void PrintOk(const char* msg) {
-    SetConsoleTextAttribute(g_console, 0x0a);
-    cout << "[OK]    " << msg << endl;
-}
+    // Core print with tag + color
+    static void Print(Color tagColor, const char* tag, const char* msg) {
+        cout << "  ";
+        SetColor(tagColor);
+        cout << tag << " ";
+        SetColor(WHITE);
+        cout << msg << endl;
+        SetColor(RESET);
+    }
 
-static void PrintDebug(const char* label, uintptr_t value) {
-    SetConsoleTextAttribute(g_console, 0x08);
-    cout << "[DEBUG] " << label << ": 0x" << hex << value << dec << endl;
-}
+    // --- Public API ---------------------------------------------------
 
-static void PrintDebug(const char* msg) {
-    SetConsoleTextAttribute(g_console, 0x08);
-    cout << "[DEBUG] " << msg << endl;
-}
+    static void Error(const char* msg) {
+        Print(RED, "[x]", msg);
+    }
 
-static void PrintStep(const char* msg) {
-    SetConsoleTextAttribute(g_console, 0x0e);
-    cout << "[STEP]  " << msg << endl;
+    static void Ok(const char* msg) {
+        Print(CYAN, "[+]", msg);
+    }
+
+    static void Info(const char* msg) {
+        Print(CYAN, "[-]", msg);
+    }
+
+    static void Warn(const char* msg) {
+        Print(YELLOW, "[!]", msg);
+    }
+
+    static void Debug(const char* msg) {
+        cout << "  ";
+        SetColor(DIM);
+        cout << "[~] " << msg << endl;
+        SetColor(RESET);
+    }
+
+    static void Debug(const char* label, uintptr_t value) {
+        cout << "  ";
+        SetColor(DIM);
+        cout << "[~] " << label << ": 0x" << hex << value << dec << endl;
+        SetColor(RESET);
+    }
+
+    static void Step(const char* msg) {
+        cout << endl;
+        cout << "  ";
+        SetColor(CYAN);
+        cout << ":: ";
+        SetColor(WHITE);
+        cout << msg << endl;
+        SetColor(RESET);
+    }
+
+    // Centered output helper
+    static void PrintCentered(const char* text) {
+        int len = (int)strlen(text);
+        int pad = (80 - len) / 2;
+        if (pad > 0) cout << std::string(pad, ' ');
+        cout << text << endl;
+    }
+
+    // Blank line
+    static void Spacer() { cout << endl; }
+
+    // Branded banner
+    static void Banner() {
+        Spacer();
+        SetColor(CYAN);
+        PrintCentered(R"(   ____  __.      .__                    .____                  )");
+        PrintCentered(R"(  |    |/ _|____  |__|_______ ___________|    |   _____     ____  )");
+        PrintCentered(R"(  |      < \__  \ |  \___   // __ \_  __ \    |   \__  \   / ___\ )");
+        PrintCentered(R"(  |    |  \ / __ \|  |/    /\  ___/|  | \/    |___ / __ \_/ /_/  >)");
+        PrintCentered(R"(  |____|__ (____  /__/_____ \\___  >__|  |_______ (____  /\___  / )");
+        PrintCentered(R"(          \/    \/         \/    \/              \/    \//_____/  )");
+        Spacer();
+        SetColor(DIM);
+        PrintCentered("v2.0 - HWID Fingerprint Spoofer");
+        SetColor(RESET);
+        Spacer();
+    }
+
+    // Success summary box
+    static void Summary(bool gaa_exitlag, bool gaa_qt, bool concurrency, uint32_t concurrency_val) {
+        Spacer();
+        SetColor(CYAN);
+        cout << "  :: Spoofing Active" << endl;
+        SetColor(RESET);
+
+        auto Row = [](bool ok, const char* name, const char* detail) {
+            SetColor(DIM);
+            cout << "     ";
+            SetColor(ok ? CYAN : DIM);
+            cout << (ok ? "+" : "-");
+            SetColor(WHITE);
+            cout << " " << name;
+            int pad = 24 - (int)strlen(name);
+            for (int i = 0; i < pad; ++i) cout << ' ';
+            SetColor(DIM);
+            cout << detail << endl;
+            SetColor(RESET);
+        };
+
+        Row(true,          "device_id",         "randomized wstring");
+        Row(true,          "product_name",      "randomized wstring");
+        Row(true,          "MACAddress",        "randomized wstring");
+        Row(gaa_exitlag,   "macAddress (exe)",  "IAT hook");
+        Row(gaa_qt,        "macAddress (Qt)",   "IAT hook");
+
+        SetColor(DIM);
+        cout << "     ";
+        SetColor(concurrency ? CYAN : DIM);
+        cout << (concurrency ? "+" : "-");
+        SetColor(WHITE);
+        cout << " concurrency             ";
+        SetColor(DIM);
+        if (concurrency)
+            cout << "returns " << dec << concurrency_val << endl;
+        else
+            cout << "not patched" << endl;
+
+        SetColor(RESET);
+        Spacer();
+        Ok("Ready. You can now log in with a new ExitLag account.");
+        Spacer();
+    }
 }
 
 
@@ -105,27 +184,27 @@ static uintptr_t FindIATEntry(HANDLE hprocess, uintptr_t module_base,
     IMAGE_DOS_HEADER dos{};
     SIZE_T rd = 0;
     if (!ReadProcessMemory(hprocess, (LPCVOID)module_base, &dos, sizeof(dos), &rd) || rd != sizeof(dos)) {
-        PrintDebug("FindIATEntry: failed to read DOS header");
+        Log::Debug("FindIATEntry: failed to read DOS header");
         return 0;
     }
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) {
-        PrintDebug("FindIATEntry: invalid DOS signature");
+        Log::Debug("FindIATEntry: invalid DOS signature");
         return 0;
     }
 
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadProcessMemory(hprocess, (LPCVOID)(module_base + dos.e_lfanew), &nt, sizeof(nt), &rd) || rd != sizeof(nt)) {
-        PrintDebug("FindIATEntry: failed to read NT headers");
+        Log::Debug("FindIATEntry: failed to read NT headers");
         return 0;
     }
     if (nt.Signature != IMAGE_NT_SIGNATURE) {
-        PrintDebug("FindIATEntry: invalid NT signature");
+        Log::Debug("FindIATEntry: invalid NT signature");
         return 0;
     }
 
     auto& import_dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (import_dir.VirtualAddress == 0 || import_dir.Size == 0) {
-        PrintDebug("FindIATEntry: no import directory");
+        Log::Debug("FindIATEntry: no import directory");
         return 0;
     }
 
@@ -142,7 +221,7 @@ static uintptr_t FindIATEntry(HANDLE hprocess, uintptr_t module_base,
         ReadProcessMemory(hprocess, (LPCVOID)(module_base + desc.Name), dll_name, sizeof(dll_name) - 1, &rd);
 
         if (_stricmp(dll_name, target_dll) == 0) {
-            PrintDebug("FindIATEntry: found DLL in imports");
+            Log::Debug("FindIATEntry: found DLL in imports");
 
             uintptr_t orig_thunk_addr = module_base + desc.OriginalFirstThunk;
             uintptr_t iat_thunk_addr  = module_base + desc.FirstThunk;
@@ -164,18 +243,18 @@ static uintptr_t FindIATEntry(HANDLE hprocess, uintptr_t module_base,
 
                 if (strcmp(func_name, target_func) == 0) {
                     uintptr_t slot = iat_thunk_addr + idx * 8;
-                    PrintDebug("FindIATEntry: found function IAT slot");
-                    PrintDebug("  IAT slot address", slot);
+                    Log::Debug("FindIATEntry: found function IAT slot");
+                    Log::Debug("  IAT slot address", slot);
                     return slot;
                 }
             }
-            PrintDebug("FindIATEntry: function not found in DLL's imports");
+            Log::Debug("FindIATEntry: function not found in DLL's imports");
             return 0;
         }
         cursor += sizeof(desc);
     }
 
-    PrintDebug("FindIATEntry: target DLL not found in import table");
+    Log::Debug("FindIATEntry: target DLL not found in import table");
     return 0;
 }
 
@@ -469,83 +548,89 @@ static bool InstallIATHook(HANDLE hprocess, uintptr_t module_base,
                             LPVOID trampoline_region, size_t& offset,
                             const char* label)
 {
-    PrintStep(label);
+    Log::Debug(label);
 
     uintptr_t iat_slot = FindIATEntry(hprocess, module_base, dll_name, func_name);
     if (!iat_slot) {
-        PrintError("  IAT entry not found.");
+        Log::Error("IAT entry not found.");
         return false;
     }
-    PrintDebug("  IAT slot", iat_slot);
+    Log::Debug("IAT slot", iat_slot);
 
     // Read the real function pointer from the IAT slot
     uintptr_t real_func = 0;
     SIZE_T rd = 0;
     if (!ReadProcessMemory(hprocess, (LPCVOID)iat_slot, &real_func, sizeof(real_func), &rd) || rd != 8) {
-        PrintError("  Failed to read real function pointer from IAT.");
+        Log::Error("Failed to read real function pointer from IAT.");
         return false;
     }
-    PrintDebug("  Real function address", real_func);
+    Log::Debug("Real function address", real_func);
 
     // Build the wrapper shellcode
     vector<uint8_t> sc = BuildGAAHookShellcode(real_func);
-    PrintDebug("  Wrapper shellcode size", sc.size());
+    Log::Debug("Wrapper shellcode size", sc.size());
 
     // Write wrapper to trampoline region at the given offset
     uintptr_t wrapper_addr = (uintptr_t)trampoline_region + offset;
     SIZE_T written = 0;
     if (!WriteProcessMemory(hprocess, (LPVOID)wrapper_addr, sc.data(), sc.size(), &written) || written != sc.size()) {
-        PrintError("  Failed to write wrapper shellcode.");
+        Log::Error("Failed to write wrapper shellcode.");
         return false;
     }
     offset += sc.size();
     // Align to 16 bytes
     offset = (offset + 15) & ~(size_t)15;
 
-    PrintDebug("  Wrapper written at", wrapper_addr);
+    Log::Debug("Wrapper written at", wrapper_addr);
 
     // Overwrite the IAT slot with our wrapper address
     DWORD old_prot = 0;
     VirtualProtectEx(hprocess, (LPVOID)iat_slot, 8, PAGE_READWRITE, &old_prot);
 
     if (!WriteProcessMemory(hprocess, (LPVOID)iat_slot, &wrapper_addr, sizeof(wrapper_addr), &written) || written != 8) {
-        PrintError("  Failed to patch IAT slot.");
+        Log::Error("Failed to patch IAT slot.");
         VirtualProtectEx(hprocess, (LPVOID)iat_slot, 8, old_prot, &old_prot);
         return false;
     }
 
     VirtualProtectEx(hprocess, (LPVOID)iat_slot, 8, old_prot, &old_prot);
 
-    PrintOk("  IAT hook installed successfully.");
+    Log::Ok("IAT hook installed.");
     return true;
 }
 
 
 static int run_bypass()
 {
-    PrintStep("=== KaizerLag v2.0 (Expanded Fingerprint Spoofing) ===");
-    cout << endl;
+    Log::Banner();
+
+    // Track results for final summary
+    bool gaa_hooked_exitlag = false;
+    bool gaa_hooked_qt      = false;
+    bool concurrency_ok     = false;
+    uint32_t spoofed_concurrency = 0;
+
 
     // ---------------------------------------------------------------
     // 1. Find ExitLag.exe process
     // ---------------------------------------------------------------
-    PrintStep("Step 1: Locating ExitLag.exe process...");
+    Log::Step("Locating ExitLag.exe process");
 
     DWORD pid = GetPIdByProcessName("ExitLag.exe");
     while (!pid) {
-        PrintInfo("Waiting for process \"ExitLag.exe\"...");
+        Log::Info("Waiting for ExitLag.exe...");
         Sleep(500);
         pid = GetPIdByProcessName("ExitLag.exe");
     }
-    PrintDebug("  PID", (uintptr_t)pid);
+    Log::Debug("PID", (uintptr_t)pid);
 
     HANDLE hprocess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hprocess || hprocess == INVALID_HANDLE_VALUE) {
-        PrintError("OpenProcess failed. Run this bypass as Administrator.");
+        Log::Error("OpenProcess failed — run as Administrator.");
         Sleep(5000);
         return 1;
     }
-    PrintOk("  Process opened successfully.");
+    Log::Ok("Process handle acquired.");
 
     // Give ExitLag a moment to map its .text fully.
     Sleep(1000);
@@ -553,39 +638,40 @@ static int run_bypass()
     // ---------------------------------------------------------------
     // 2. Get module base and image size
     // ---------------------------------------------------------------
-    PrintStep("Step 2: Resolving module base...");
+    Log::Step("Resolving module base");
 
     uintptr_t module_base = GetModuleAddressByName(pid, "ExitLag.exe");
     if (!module_base) {
-        PrintError("Error on GetModuleAddress... Make sure the bypass is built as x64.");
+        Log::Error("GetModuleAddress failed — ensure bypass is built as x64.");
         CloseHandle(hprocess);
         Sleep(5000);
         return 1;
     }
-    PrintDebug("  ExitLag.exe base", module_base);
+    Log::Debug("ExitLag.exe base", module_base);
 
     SIZE_T image_size = GetModuleImageSize(hprocess, module_base);
     if (!image_size) {
         image_size = 0x08000000; // 128 MiB fallback
-        PrintDebug("  Using fallback image size");
+        Log::Debug("Using fallback image size (128 MiB)");
     }
-    PrintDebug("  Image size", image_size);
+    Log::Debug("Image size", image_size);
 
     // ---------------------------------------------------------------
     // 3. Allocate trampoline region (large enough for all hooks)
     // ---------------------------------------------------------------
-    PrintStep("Step 3: Allocating trampoline memory...");
+    Log::Step("Allocating trampoline memory");
 
     LPVOID trampoline = VirtualAllocEx(hprocess, nullptr, 0x4000,
                                         MEM_COMMIT | MEM_RESERVE,
                                         PAGE_EXECUTE_READWRITE);
     if (!trampoline) {
-        PrintError("VirtualAllocEx failed.");
+        Log::Error("VirtualAllocEx failed.");
         CloseHandle(hprocess);
         Sleep(5000);
         return 1;
     }
-    PrintDebug("  Trampoline region at", (uintptr_t)trampoline);
+    Log::Ok("Trampoline allocated.");
+    Log::Debug("Trampoline region", (uintptr_t)trampoline);
 
     size_t tramp_offset = 0; // current write offset in the trampoline region
 
@@ -595,7 +681,7 @@ static int run_bypass()
     //    falls back to increasingly generic patterns so that minor
     //    recompilations (changed stack offsets) don't break the scan.
     // ---------------------------------------------------------------
-    PrintStep("Step 4: Installing device_id/product_name inline hook...");
+    Log::Step("Installing device_id / product_name inline hook");
 
     // Pattern cascade — ordered most-specific to most-generic.
     // All patterns target the 3-byte "mov rdx, rbx" (48 8B D3) followed
@@ -628,26 +714,31 @@ static int run_bypass()
 
         if (hook_addr) {
             pattern_idx = pi;
-            SetConsoleTextAttribute(g_console, 0x0a);
-            cout << "[OK]    Pattern P" << pi << " matched." << endl;
+            { // format pattern match message
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Pattern P%d matched.", pi);
+                Log::Ok(buf);
+            }
             break;
         }
-        PrintDebug("  Pattern P", (uintptr_t)pi);
-        PrintDebug("  -> no match, trying next...");
+        { // format pattern miss message
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Pattern P%d — no match, trying next...", pi);
+            Log::Debug(buf);
+        }
     }
 
     if (!hook_addr) {
-        PrintError(
-            "No pattern matched. ExitLag has likely changed significantly. "
-            "Open the new binary in IDA, find the fromStdWString call near "
-            "the \"device_id\" string ref, and add a new pattern.");
+        Log::Error("No pattern matched — ExitLag binary has changed.");
+        Log::Info("Open the new binary in IDA, find the fromStdWString call");
+        Log::Info("near the \"device_id\" string ref, and add a new pattern.");
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
         Sleep(10000);
         return 1;
     }
 
-    PrintDebug("  Hook site found at", hook_addr);
+    Log::Debug("Hook site", hook_addr);
 
     // Read the stolen instructions (first 7 bytes: mov rdx,rbx + lea rcx,[rbp+??])
     // These are replayed verbatim in the shellcode so we adapt to any offset.
@@ -655,34 +746,34 @@ static int run_bypass()
     uint8_t stolen[STOLEN_LEN] = {};
     SIZE_T rd = 0;
     if (!ReadProcessMemory(hprocess, (LPCVOID)hook_addr, stolen, STOLEN_LEN, &rd) || rd != STOLEN_LEN) {
-        PrintError("Failed to read stolen instructions from hook site.");
+        Log::Error("Failed to read stolen instructions from hook site.");
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
         Sleep(5000);
         return 1;
     }
-    PrintDebug("  Stolen bytes read OK (7 bytes)");
+    Log::Debug("Stolen bytes read OK (7 bytes)");
 
     // Compute the RIP-relative IAT slot for QString::fromStdWString
     // The FF 15 xx xx xx xx instruction starts at hook_addr + 7
     int32_t disp32 = 0;
     if (!ReadProcessMemory(hprocess, (LPCVOID)(hook_addr + 9), &disp32, sizeof(disp32), &rd) || rd != sizeof(disp32)) {
-        PrintError("Failed to read fromStdWString displacement.");
+        Log::Error("Failed to read fromStdWString displacement.");
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
         Sleep(5000);
         return 1;
     }
     uintptr_t iat_slot = hook_addr + 13 + (int64_t)disp32;
-    PrintDebug("  fromStdWString IAT slot", iat_slot);
+    Log::Debug("fromStdWString IAT slot", iat_slot);
 
     // Build shellcode — pass stolen bytes so they're replayed verbatim
     const uintptr_t return_addr = hook_addr + 14;
     vector<uint8_t> sc = BuildShellcode(stolen, STOLEN_LEN, iat_slot, return_addr);
-    PrintDebug("  Inline hook shellcode size", sc.size());
+    Log::Debug("Inline hook shellcode size", sc.size());
 
     if (sc.empty()) {
-        PrintError("BuildShellcode returned empty.");
+        Log::Error("BuildShellcode returned empty.");
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
         Sleep(5000);
@@ -693,7 +784,7 @@ static int run_bypass()
     uintptr_t inline_hook_addr = (uintptr_t)trampoline + tramp_offset;
     SIZE_T written = 0;
     if (!WriteProcessMemory(hprocess, (LPVOID)inline_hook_addr, sc.data(), sc.size(), &written) || written != sc.size()) {
-        PrintError("WriteProcessMemory (inline hook shellcode) failed.");
+        Log::Error("WriteProcessMemory (inline hook shellcode) failed.");
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
         Sleep(5000);
@@ -702,7 +793,7 @@ static int run_bypass()
     tramp_offset += sc.size();
     tramp_offset = (tramp_offset + 15) & ~(size_t)15; // align
 
-    PrintDebug("  Inline hook shellcode written at", inline_hook_addr);
+    Log::Debug("Inline hook shellcode @", inline_hook_addr);
 
     // Patch the hook site with JMP to our shellcode
     uint8_t hook_patch[14] = {
@@ -713,7 +804,7 @@ static int run_bypass()
 
     DWORD old_prot = 0;
     if (!VirtualProtectEx(hprocess, (LPVOID)hook_addr, sizeof(hook_patch), PAGE_EXECUTE_READWRITE, &old_prot)) {
-        PrintError("VirtualProtectEx (hook site) failed.");
+        Log::Error("VirtualProtectEx (hook site) failed.");
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
         Sleep(5000);
@@ -721,7 +812,7 @@ static int run_bypass()
     }
 
     if (!WriteProcessMemory(hprocess, (LPVOID)hook_addr, hook_patch, sizeof(hook_patch), &written) || written != sizeof(hook_patch)) {
-        PrintError("WriteProcessMemory (hook patch) failed.");
+        Log::Error("WriteProcessMemory (hook patch) failed.");
         VirtualProtectEx(hprocess, (LPVOID)hook_addr, sizeof(hook_patch), old_prot, &old_prot);
         VirtualFreeEx(hprocess, trampoline, 0, MEM_RELEASE);
         CloseHandle(hprocess);
@@ -732,20 +823,20 @@ static int run_bypass()
     VirtualProtectEx(hprocess, (LPVOID)hook_addr, sizeof(hook_patch), old_prot, &old_prot);
     FlushInstructionCache(hprocess, (LPCVOID)hook_addr, sizeof(hook_patch));
 
-    PrintOk("  device_id/product_name inline hook installed.");
+    Log::Ok("Inline hook installed (device_id / product_name / MACAddress).");
 
     // ---------------------------------------------------------------
     // 5. Install GetAdaptersAddresses IAT hook in ExitLag.exe
     //    This randomizes MAC addresses at the WinAPI level, covering
     //    both the simplified HWID JSON and the detailed adapter JSON.
     // ---------------------------------------------------------------
-    PrintStep("Step 5: Installing GetAdaptersAddresses IAT hook (ExitLag.exe)...");
+    Log::Step("Installing GetAdaptersAddresses IAT hook (ExitLag.exe)");
 
-    bool gaa_hooked_exitlag = InstallIATHook(
+    gaa_hooked_exitlag = InstallIATHook(
         hprocess, module_base,
         "IPHLPAPI.DLL", "GetAdaptersAddresses",
         trampoline, tramp_offset,
-        "  Hooking ExitLag.exe -> IPHLPAPI.DLL -> GetAdaptersAddresses"
+        "Hooking ExitLag.exe -> IPHLPAPI.DLL"
     );
 
     if (!gaa_hooked_exitlag) {
@@ -754,50 +845,51 @@ static int run_bypass()
             hprocess, module_base,
             "iphlpapi.dll", "GetAdaptersAddresses",
             trampoline, tramp_offset,
-            "  Retrying with lowercase DLL name..."
+            "Retrying with lowercase DLL name"
         );
     }
 
     if (gaa_hooked_exitlag) {
-        PrintOk("  GetAdaptersAddresses IAT hook active in ExitLag.exe.");
+        Log::Ok("GetAdaptersAddresses IAT hook active in ExitLag.exe.");
     } else {
-        PrintError("  WARNING: Could not hook GetAdaptersAddresses in ExitLag.exe.");
-        PrintInfo("  The MAC address in the detailed adapter JSON may not be spoofed.");
+        Log::Warn("Could not hook GetAdaptersAddresses in ExitLag.exe.");
+        Log::Info("MAC address in the detailed adapter JSON may leak.");
     }
 
     // ---------------------------------------------------------------
     // 5b. Try to also hook GetAdaptersAddresses in Qt6Network.dll
     //     (Qt uses its own IAT entry to enumerate network interfaces)
     // ---------------------------------------------------------------
-    PrintStep("Step 5b: Looking for Qt6Network.dll to hook its IAT...");
+    Log::Step("Looking for Qt6Network.dll IAT hook");
 
     uintptr_t qt_net_base = GetModuleAddressByName(pid, "Qt6Network.dll");
     if (qt_net_base) {
-        PrintDebug("  Qt6Network.dll base", qt_net_base);
+        Log::Debug("Qt6Network.dll base", qt_net_base);
 
-        bool gaa_hooked_qt = InstallIATHook(
+        bool gaa_qt = InstallIATHook(
             hprocess, qt_net_base,
             "IPHLPAPI.DLL", "GetAdaptersAddresses",
             trampoline, tramp_offset,
-            "  Hooking Qt6Network.dll -> IPHLPAPI.DLL -> GetAdaptersAddresses"
+            "Hooking Qt6Network.dll -> IPHLPAPI.DLL"
         );
 
-        if (!gaa_hooked_qt) {
-            gaa_hooked_qt = InstallIATHook(
+        if (!gaa_qt) {
+            gaa_qt = InstallIATHook(
                 hprocess, qt_net_base,
                 "iphlpapi.dll", "GetAdaptersAddresses",
                 trampoline, tramp_offset,
-                "  Retrying with lowercase DLL name..."
+                "Retrying lowercase DLL name"
             );
         }
 
-        if (gaa_hooked_qt) {
-            PrintOk("  GetAdaptersAddresses IAT hook active in Qt6Network.dll.");
+        if (gaa_qt) {
+            Log::Ok("GetAdaptersAddresses IAT hook active in Qt6Network.dll.");
+            gaa_hooked_qt = true;
         } else {
-            PrintInfo("  Qt6Network.dll doesn't import GetAdaptersAddresses directly (may use ordinal).");
+            Log::Info("Qt6Network.dll doesn't import GetAdaptersAddresses directly.");
         }
     } else {
-        PrintInfo("  Qt6Network.dll not yet loaded. MAC spoofing relies on ExitLag.exe IAT hook.");
+        Log::Info("Qt6Network.dll not loaded — MAC spoofing relies on ExitLag.exe IAT hook.");
     }
 
     // ---------------------------------------------------------------
@@ -805,7 +897,7 @@ static int run_bypass()
     //    Found dynamically via IAT import name resolution from
     //    MSVCP140.dll — no hardcoded RVA needed.
     // ---------------------------------------------------------------
-    PrintStep("Step 6: Patching _Thrd_hardware_concurrency (via IAT lookup)...");
+    Log::Step("Patching _Thrd_hardware_concurrency (IAT lookup)");
 
     // Resolve the function address dynamically through the IAT.
     // _Thrd_hardware_concurrency is imported by name from MSVCP140.dll.
@@ -821,12 +913,12 @@ static int run_bypass()
         // Read the resolved function pointer (where the actual code lives)
         uintptr_t thrd_hw_addr = 0;
         if (ReadProcessMemory(hprocess, (LPCVOID)thrd_iat_slot, &thrd_hw_addr, sizeof(thrd_hw_addr), &rd) && rd == 8 && thrd_hw_addr) {
-            PrintDebug("  _Thrd_hardware_concurrency resolved at", thrd_hw_addr);
+            Log::Debug("_Thrd_hardware_concurrency resolved at", thrd_hw_addr);
 
             // Generate a plausible random thread count: 4, 6, 8, 12, or 16
             const uint32_t plausible_counts[] = { 4, 6, 8, 12, 16 };
             srand(GetTickCount());
-            uint32_t spoofed_concurrency = plausible_counts[rand() % 5];
+            spoofed_concurrency = plausible_counts[rand() % 5];
 
             // Build patch: mov eax, <value>; ret (6 bytes)
             uint8_t concurrency_patch[6] = {
@@ -844,21 +936,25 @@ static int run_bypass()
                     VirtualProtectEx(hprocess, (LPVOID)thrd_hw_addr, 6, prot2, &prot2);
                     FlushInstructionCache(hprocess, (LPCVOID)thrd_hw_addr, 6);
 
-                    SetConsoleTextAttribute(g_console, 0x0a);
-                    cout << "[OK]    Concurrency spoofed to: " << dec << spoofed_concurrency << " threads" << endl;
+                    concurrency_ok = true;
+                    {
+                        char buf[80];
+                        snprintf(buf, sizeof(buf), "Concurrency spoofed to %u threads.", spoofed_concurrency);
+                        Log::Ok(buf);
+                    }
                 } else {
                     VirtualProtectEx(hprocess, (LPVOID)thrd_hw_addr, 6, prot2, &prot2);
-                    PrintError("  Failed to write concurrency patch.");
+                    Log::Error("Failed to write concurrency patch.");
                 }
             } else {
-                PrintError("  VirtualProtectEx failed for concurrency patch.");
+                Log::Error("VirtualProtectEx failed for concurrency patch.");
             }
         } else {
-            PrintError("  Failed to read resolved address from IAT slot.");
+            Log::Error("Failed to read resolved address from IAT slot.");
         }
     } else {
-        PrintError("  _Thrd_hardware_concurrency not found in IAT. Concurrency will not be spoofed.");
-        PrintInfo("  This is non-fatal — the other spoofing vectors are still active.");
+        Log::Warn("_Thrd_hardware_concurrency not found in IAT - skipped.");
+        Log::Info("Non-fatal: other spoofing vectors remain active.");
     }
 
     // ---------------------------------------------------------------
@@ -866,23 +962,11 @@ static int run_bypass()
     // ---------------------------------------------------------------
     CloseHandle(hprocess);
 
-    cout << endl;
-    SetConsoleTextAttribute(g_console, 0x0a);
-    cout << "============================================================" << endl;
-    cout << "  All hooks installed successfully!" << endl;
-    cout << "  Spoofed vectors:" << endl;
-    cout << "    [+] device_id        (randomized wstring)" << endl;
-    cout << "    [+] product_name     (randomized wstring)" << endl;
-    cout << "    [+] MACAddress       (randomized wstring)" << endl;
-    cout << "    [+] macAddress       (randomized via GetAdaptersAddresses)" << endl;
-    cout << "    [+] concurrency      (spoofed via IAT patch)" << endl;
-    cout << "============================================================" << endl;
-    cout << endl;
-    PrintOk("You can now log in with a new ExitLag account to claim a fresh 3-day trial.");
-    cout << endl;
+    Log::Summary(gaa_hooked_exitlag, gaa_hooked_qt, concurrency_ok, spoofed_concurrency);
 
-    SetConsoleTextAttribute(g_console, 0x07);
-    cout << "Press Enter to exit..." << endl;
+    Log::SetColor(Log::DIM);
+    cout << "  Press Enter to exit..." << endl;
+    Log::SetColor(Log::RESET);
     std::cin.get();
     return 0;
 }
@@ -890,10 +974,19 @@ static int run_bypass()
 
 int main()
 {
-    system("cls");
-    system("MODE con cols=100 lines=40");
     setlocale(LC_ALL, "");
-    SetConsoleTextAttribute(g_console, 0x0a);
+    SetConsoleTitleA("KaizerLag v2.0");
+
+    // Resize console without clearing (system("MODE ...") wipes the buffer).
+    {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        COORD bufSize = { 80, 500 };   // 80 cols, 500-line scroll buffer
+        SetConsoleScreenBufferSize(hOut, bufSize);
+        SMALL_RECT win = { 0, 0, 79, 39 }; // 80 x 40 visible window
+        SetConsoleWindowInfo(hOut, TRUE, &win);
+    }
+
+    Log::SetColor(Log::RESET);
 
     // Kick ExitLag if not running.
     if (GetPIdByProcessName("ExitLag.exe") == 0) {
