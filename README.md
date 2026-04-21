@@ -4,6 +4,9 @@ x64 hwid spoofer for newer exitlag builds.
 
 forked from alehacksp's original bypass. pushed it to x64 and added some iat hooking and protobuf auth spoofing. it randomizes device ids, mac addresses, and product names so you can just make a new account.
 
+## guide
+use a temp email and create an account in https://www.exitlag.com/lp/trial
+
 ## usage
 open the sln in visual studio, build for x64, and run it. it patches the process in memory. 
 
