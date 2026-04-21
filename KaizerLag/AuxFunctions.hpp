@@ -1,8 +1,5 @@
 #pragma once
 
-// Get the process id of the process, knowing the process name.
-// const char* name -> the name of the process (ANSI).
-// return DWORD -> the process identifier, or 0 if not found.
 DWORD GetPIdByProcessName(const char* name)
 {
 	PROCESSENTRY32 PE32;
@@ -26,14 +23,7 @@ DWORD GetPIdByProcessName(const char* name)
 }
 
 
-// Get the base address of a module inside a target process.
-// DWORD Pid           -> the process id of the target.
-// const char* ModuleName -> the name of the module (e.g. "ExitLag.exe").
-// return uintptr_t -> the module base address, or 0 if not found.
-//
-// NOTE: CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ...) can only enumerate
-// modules with the same bitness as the caller. The bypass MUST be compiled as
-// x64 (Platform=x64) for this to work against the current 64-bit ExitLag.
+// same-bitness only. if this tool is x86, module snapshots will lie to you.
 uintptr_t GetModuleAddressByName(DWORD Pid, const char* ModuleName) {
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, Pid);
 	if (snapshot == INVALID_HANDLE_VALUE) return 0;
@@ -58,8 +48,7 @@ uintptr_t GetModuleAddressByName(DWORD Pid, const char* ModuleName) {
 }
 
 
-// Resolve the SizeOfImage for a loaded module by parsing its PE headers.
-// Returns 0 on failure.
+// quick pe header read for scan bounds.
 SIZE_T GetModuleImageSize(HANDLE hprocess, uintptr_t module_base) {
 	IMAGE_DOS_HEADER dos{};
 	SIZE_T read = 0;
@@ -76,7 +65,6 @@ SIZE_T GetModuleImageSize(HANDLE hprocess, uintptr_t module_base) {
 }
 
 
-// Split a string by a delimiter.
 vector<string> split(const string& s, char delimiter)
 {
 	vector<string> tokens;
@@ -89,12 +77,11 @@ vector<string> split(const string& s, char delimiter)
 	return tokens;
 }
 
-// "AA" -> 0xAA
 BYTE StrHexToInt(string hex_byte_str) {
 	return (BYTE)strtoul(hex_byte_str.c_str(), nullptr, 16);
 }
 
-// "AA BB ?? CC" -> bytes=[0xAA,0xBB,0x00,0xCC], mask="xx?x"
+// turns "AA BB ?? CC" into bytes plus the wildcard mask the scanner wants.
 void PatternStringToBytePatternAndMask(string in_pattern, vector<byte>* out_pattern, string* out_mask) {
 	vector<string> res = split(in_pattern, ' ');
 	string mask;
@@ -115,11 +102,7 @@ void PatternStringToBytePatternAndMask(string in_pattern, vector<byte>* out_patt
 	*out_mask = mask;
 }
 
-// Pattern-scan an arbitrary virtual range in a target process.
-// Walks committed pages via VirtualQueryEx and skips anything unreadable
-// (PAGE_NOACCESS / PAGE_GUARD / uncommitted). No protection mutation.
-//
-// Returns the first match address, or 0 if not found.
+// page-by-page scanner that stays read-only and skips bad regions.
 uintptr_t ExPatternScanByStartAddress(HANDLE hprocess,
 									  uintptr_t start_address,
 									  SIZE_T section_size,
@@ -164,7 +147,7 @@ uintptr_t ExPatternScanByStartAddress(HANDLE hprocess,
 			}
 		}
 
-		if (region_end <= cursor) break; // guard against infinite loop
+		if (region_end <= cursor) break; // just in case VirtualQueryEx gets weird.
 		cursor = region_end;
 	}
 	return 0;
